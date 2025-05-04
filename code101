@@ -1,0 +1,302 @@
+import sys
+from PIL import ImageFile
+
+sys.modules['ImageFile'] = ImageFile
+import cv2
+import os
+import tempfile
+import threading
+from PIL import Image
+import yt_dlp
+from skimage.metrics import structural_similarity as ssim
+from tkinter import Tk, Label, Button, Entry, filedialog, StringVar, Frame, messagebox, OptionMenu
+from pptx import Presentation
+from pptx.util import Inches, Pt
+
+
+def get_video_info(url):
+    ydl_opts = {
+        'skip_download': True,
+        'ignoreerrors': True
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        video_info = ydl.extract_info(url, download=False)
+        formats = video_info.get('formats', [])
+        qualities = []
+        for f in formats:
+            if f.get('height'):
+                qualities.append(f"{f['height']}p")
+        qualities = list(set(qualities))
+        duration = video_info.get('duration', 0)
+        return qualities, duration
+
+
+def format_duration(duration_in_seconds):
+    """Convert seconds to hh:mm:ss format."""
+    hours = duration_in_seconds // 3600
+    minutes = (duration_in_seconds % 3600) // 60
+    seconds = duration_in_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def time_to_seconds(hh_mm_ss):
+    """Convert hh:mm:ss format to seconds."""
+    time_parts = hh_mm_ss.split(':')
+    if len(time_parts) == 3:
+        hours, minutes, seconds = map(int, time_parts)
+        return hours * 3600 + minutes * 60 + seconds
+    else:
+        raise ValueError("Time should be in hh:mm:ss format")
+
+
+def download_video(url, quality, download_dir, max_retries=3):
+    quality_map = {
+        "144p": 144,
+        "240p": 240,
+        "360p": 360,
+        "480p": 480,
+        "720p": 720,
+        "1080p": 1080,
+        "1440p": 1440,
+        "2160p": 2160
+    }
+
+    height = quality_map.get(quality, 360)
+
+    ydl_opts = {
+        'outtmpl': os.path.join(download_dir, 'video.%(ext)s'),
+        'format': f'bestvideo[height={height}]+bestaudio/best',
+        'merge_output_format': 'mp4',
+        'noplaylist': True,
+    }
+
+    retries = 0
+    while retries < max_retries:
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                return filename
+        except yt_dlp.utils.DownloadError as e:
+            retries += 1
+    raise Exception("Failed to download video after multiple attempts.")
+
+
+def extract_unique_frames(video_file, output_folder, start_time, end_time, n=3, ssim_threshold=0.8):
+    cap = cv2.VideoCapture(video_file)
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    last_frame = None
+    saved_frame = None
+    frame_number = 0
+    last_saved_frame_number = -1
+    timestamps = []
+
+    start_frame = int(start_time * fps)
+    end_frame = int(end_time * fps)
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret or frame_number > end_frame:
+            break
+
+        if frame_number >= start_frame and frame_number % n == 0:
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray_frame = cv2.resize(gray_frame, (640, 360))
+
+            if last_frame is not None:
+                similarity = ssim(gray_frame, last_frame, data_range=gray_frame.max() - gray_frame.min())
+
+                if similarity < ssim_threshold:
+                    if saved_frame is not None and frame_number - last_saved_frame_number > fps:
+                        frame_path = os.path.join(output_folder, f'frame{frame_number:04d}_{frame_number // fps}.png')
+                        cv2.imwrite(frame_path, saved_frame, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+                        timestamps.append((frame_number, frame_number // fps))
+
+                    saved_frame = frame
+                    last_saved_frame_number = frame_number
+                else:
+                    saved_frame = frame
+
+            else:
+                frame_path = os.path.join(output_folder, f'frame{frame_number:04d}_{frame_number // fps}.png')
+                cv2.imwrite(frame_path, frame, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+                timestamps.append((frame_number, frame_number // fps))
+                last_saved_frame_number = frame_number
+
+            last_frame = gray_frame
+
+        frame_number += 1
+
+    cap.release()
+    return timestamps
+
+
+def convert_frames_to_ppt(input_folder, output_file, timestamps):
+    prs = Presentation()
+    slide_width = prs.slide_width
+    slide_height = prs.slide_height
+    frame_files = sorted(os.listdir(input_folder), key=lambda x: int(x.split('_')[0].split('frame')[-1]))
+
+    for i, (frame_file, (frame_number, timestamp_seconds)) in enumerate(zip(frame_files, timestamps)):
+        # Use a blank layout (index 6 is usually blank in default template)
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        frame_path = os.path.join(input_folder, frame_file)
+
+        img = Image.open(frame_path)
+        img_width, img_height = img.size
+
+        # Calculate image dimensions while maintaining the aspect ratio
+        aspect_ratio = img_width / img_height
+        if aspect_ratio > 1:  # Landscape image
+            img_width_scaled = slide_width
+            img_height_scaled = int(slide_width / aspect_ratio)
+        else:  # Portrait image
+            img_height_scaled = slide_height
+            img_width_scaled = int(slide_height * aspect_ratio)
+
+        # Center the image on the slide
+        left = (slide_width - img_width_scaled) // 2
+        top = (slide_height - img_height_scaled) // 2
+
+        # Add the image
+        slide.shapes.add_picture(frame_path, left, top, width=img_width_scaled, height=img_height_scaled)
+
+        # Add the timestamp
+        timestamp = f"{timestamp_seconds // 3600:02d}:{(timestamp_seconds % 3600) // 60:02d}:{timestamp_seconds % 60:02d}"
+        textbox = slide.shapes.add_textbox(left, top + Inches(0.5), Inches(2), Inches(0.5))
+        text_frame = textbox.text_frame
+        p = text_frame.add_paragraph()
+        p.text = timestamp
+        p.font.size = Pt(18)
+
+    prs.save(output_file)
+
+def get_video_title(url):
+    ydl_opts = {
+        'skip_download': True,
+        'ignoreerrors': True
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        video_info = ydl.extract_info(url, download=False)
+        title = video_info['title'].replace('/', '-').replace('\\', '-').replace(':', '-').replace('*', '-').replace(
+            '?', '-').replace('<', '-').replace('>', '-').replace('|', '-').replace('"', '-').strip('.')
+        return title
+
+
+def process_video(url, quality, download_dir, output_folder, start_time, end_time, result_var):
+    try:
+        video_file = download_video(url, quality, download_dir)
+        video_title = get_video_title(url)
+        output_ppt_name = os.path.join(output_folder, f"{video_title}.pptx")
+
+        with tempfile.TemporaryDirectory() as temp_folder:
+            timestamps = extract_unique_frames(video_file, temp_folder, start_time, end_time)
+            convert_frames_to_ppt(temp_folder, output_ppt_name, timestamps)
+
+        result_var.set(f"File saved as:\nPPT - {output_ppt_name}")
+
+    except Exception as e:
+        result_var.set(f"Error: {str(e)}")
+
+
+def run_processing(url, quality, download_dir, output_folder, start_time_str, end_time_str, result_var):
+    try:
+        # Convert the hh:mm:ss inputs to seconds
+        start_time = time_to_seconds(start_time_str)
+        end_time = time_to_seconds(end_time_str)
+
+        threading.Thread(target=process_video,
+                         args=(url, quality, download_dir, output_folder, start_time, end_time, result_var)).start()
+    except ValueError as ve:
+        result_var.set(f"Invalid time format: {str(ve)}")
+
+
+def browse_folder(entry):
+    folder_selected = filedialog.askdirectory()
+    if folder_selected:
+        entry.delete(0, 'end')
+        entry.insert(0, folder_selected)
+
+
+def fetch_and_update_qualities(url_entry, quality_var, quality_menu, duration_var):
+    url = url_entry.get()
+    if not url:
+        messagebox.showerror("Input Error", "Please enter a video URL.")
+        return
+
+    qualities, duration = get_video_info(url)
+    quality_var.set(qualities[0])
+    quality_menu["menu"].delete(0, "end")
+
+    for quality in qualities:
+        quality_menu["menu"].add_command(label=quality, command=lambda q=quality: quality_var.set(q))
+
+    # Format the duration in hh:mm:ss
+    duration_formatted = format_duration(duration)
+    duration_var.set(f"Video Duration: {duration_formatted}")
+
+
+def main_gui():
+    root = Tk()
+    root.title("Video to PowerPoint Converter")
+
+    url_frame = Frame(root)
+    url_frame.pack(padx=10, pady=5)
+    Label(url_frame, text="Video URL:").pack(side='left')
+    url_entry = Entry(url_frame, width=50)
+    url_entry.pack(side='left')
+
+    quality_frame = Frame(root)
+    quality_frame.pack(padx=10, pady=5)
+    Label(quality_frame, text="Quality:").pack(side='left')
+    quality_var = StringVar(root)
+    quality_menu = OptionMenu(quality_frame, quality_var, [])
+    quality_menu.pack(side='left')
+
+    Button(quality_frame, text="Fetch Info",
+           command=lambda: fetch_and_update_qualities(url_entry, quality_var, quality_menu, duration_var)).pack(
+        side='left')
+
+    download_frame = Frame(root)
+    download_frame.pack(padx=10, pady=5)
+    Label(download_frame, text="Download Directory:").pack(side='left')
+    download_dir_entry = Entry(download_frame, width=40)
+    download_dir_entry.pack(side='left')
+    Button(download_frame, text="Browse", command=lambda: browse_folder(download_dir_entry)).pack(side='left')
+
+    output_frame = Frame(root)
+    output_frame.pack(padx=10, pady=5)
+    Label(output_frame, text="Output Directory:").pack(side='left')
+    output_dir_entry = Entry(output_frame, width=40)
+    output_dir_entry.pack(side='left')
+    Button(output_frame, text="Browse", command=lambda: browse_folder(output_dir_entry)).pack(side='left')
+
+    time_frame = Frame(root)
+    time_frame.pack(padx=10, pady=5)
+    Label(time_frame, text="Start Time (hh:mm:ss):").pack(side='left')
+    start_time_entry = Entry(time_frame, width=10)
+    start_time_entry.pack(side='left')
+
+    Label(time_frame, text="End Time (hh:mm:ss):").pack(side='left')
+    end_time_entry = Entry(time_frame, width=10)
+    end_time_entry.pack(side='left')
+
+    duration_var = StringVar(root)
+    duration_label = Label(root, textvariable=duration_var, wraplength=500, justify="center")
+    duration_label.pack(padx=10, pady=10)
+
+    result_var = StringVar(root)
+    result_label = Label(root, textvariable=result_var, wraplength=500, justify="center")
+    result_label.pack(padx=10, pady=10)
+
+    start_button = Button(root, text="Start Processing", command=lambda: run_processing(
+        url_entry.get(), quality_var.get(), download_dir_entry.get(), output_dir_entry.get(),
+        start_time_entry.get(), end_time_entry.get(), result_var
+    ))
+    start_button.pack(padx=10, pady=10)
+
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main_gui()
